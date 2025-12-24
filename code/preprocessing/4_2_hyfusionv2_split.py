@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# IMPORTS
+import os, json, math, csv
+import numpy as np
+import pandas as pd
+import cv2
+import pydicom
+from typing import List, Optional
+from tqdm import tqdm
+
+from pydicom.pixel_data_handlers.util import apply_voi_lut
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+# CONFIG
+TARGET_SIZE = 1024
+
+BG_THRESHOLD = 0.05
+MIN_CONTENT_FRAC = 0.15
+
+SIGMA_HOMO = 30.0
+HIGH_GAIN = 1.5
+LOW_GAIN = 0.5
+ALPHA_FREQ_BLEND = 0.6
+
+PSNR_MIN = 25.0
+SSIM_MIN = 0.80
+CNR_MIN  = 0.8
+
+ALPHA_MIN_SAFETY = 0.05
+DELTA_ALPHA = 0.05
+
+ALPHA_MIN = 0.2
+ALPHA_MAX = 0.9
+
+ROOT_SPLIT = "../../dataset/split_dataset"
+OUT_ROOT   = "../../dataset/hyfusion_v2"
+
+NPY_ROOT   = os.path.join(OUT_ROOT, "NPY")
+PNG_ROOT   = os.path.join(OUT_ROOT, "PNG")
+MAN_ROOT   = os.path.join(OUT_ROOT, "manifest")
+LOG_PATH = os.path.join(MAN_ROOT, "log.txt")
+
+
+for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
+    os.makedirs(p, exist_ok=True)
+
+with open(LOG_PATH, "w") as f:
+    f.write("# HyFusion-v2 Rollback Log\n")
+
+for split in ["train", "val", "test"]:
+    for cls in ["TB", "NonTB"]:
+        os.makedirs(os.path.join(PNG_ROOT, split, cls), exist_ok=True)
+
+
+# UTIL — CORE
+def extract_2d(img):
+    img = np.asarray(img)
+    if img.ndim == 2:
+        return img.astype(np.float32)
+    if img.ndim == 3 and img.shape[-1] > 1:
+        return img[..., 0].astype(np.float32)
+    if img.ndim == 3 and img.shape[0] > 1:
+        return img[0].astype(np.float32)
+    if img.ndim == 3:
+        vars_ = np.var(img.reshape(img.shape[0], -1), axis=1)
+        return img[int(np.argmax(vars_))].astype(np.float32)
+    if img.ndim == 4:
+        return img[0, ..., 0].astype(np.float32)
+    return np.squeeze(img).astype(np.float32)
+
+def needs_inversion(ds, img):
+    pi = getattr(ds, "PhotometricInterpretation", None)
+    if pi == "MONOCHROME1":
+        return True
+    if pi == "MONOCHROME2":
+        return False
+    h, w = img.shape
+    b = max(1, int(min(h, w) * 0.05))
+    border = np.concatenate([img[:b, :].ravel(), img[-b:, :].ravel(),
+                              img[:, :b].ravel(), img[:, -b:].ravel()])
+    return float(border.mean()) > float(np.median(img))
+
+def pad_to_1024(img: np.ndarray):
+    h, w = img.shape
+    scale = min(TARGET_SIZE / h, TARGET_SIZE / w)
+
+    # DOWNSCALE ONLY IF NEEDED 
+    if scale < 1.0:
+        new_h = int(round(h * scale))
+        new_w = int(round(w * scale))
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        h, w = img.shape
+    else:
+        new_h, new_w = h, w
+
+    # PADDING
+    pt = (TARGET_SIZE - new_h) // 2
+    pb = TARGET_SIZE - new_h - pt
+    pl = (TARGET_SIZE - new_w) // 2
+    pr = TARGET_SIZE - new_w - pl
+
+    # safety 
+    assert pt >= 0 and pb >= 0 and pl >= 0 and pr >= 0, \
+        f"Invalid padding: {(pt, pb, pl, pr)} for shape {(new_h, new_w)}"
+
+    canvas = np.pad(
+        img,
+        ((pt, pb), (pl, pr)),
+        mode="constant",
+        constant_values=0
+    )
+
+    valid_mask = np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=bool)
+    valid_mask[pt:pt+new_h, pl:pl+new_w] = True
+
+    pad_info = {
+        "orig_h": h,
+        "orig_w": w,
+        "scaled_h": new_h,
+        "scaled_w": new_w,
+        "scale": scale,
+        "pad_top": pt,
+        "pad_bottom": pb,
+        "pad_left": pl,
+        "pad_right": pr,
+    }
+
+    return canvas.astype(np.float32), valid_mask, pad_info
+
+# FREQUENCY & SPATIAL
+def homomorphic_filter(img):
+    mn, mx = img.min(), img.max()
+    norm = (img - mn) / (mx - mn + 1e-12)
+    L = np.log1p(norm)
+    F = np.fft.fftshift(np.fft.fft2(L))
+    r, c = img.shape
+    cy, cx = r//2, c//2
+    y, x = np.ogrid[:r, :c]
+    D2 = (y-cy)**2 + (x-cx)**2
+    H = (HIGH_GAIN-LOW_GAIN)*(1-np.exp(-D2/(2*SIGMA_HOMO**2))) + LOW_GAIN
+    Lf = np.real(np.fft.ifft2(np.fft.ifftshift(F*H)))
+    exp = np.expm1(Lf)
+    exp = (exp-exp.min())/(exp.max()-exp.min()+1e-12)
+    return exp*(mx-mn)+mn
+
+def adaptive_gamma(img):
+    mn, mx = img.min(), img.max()
+    img_n = (img-mn)/(mx-mn+1e-12)
+    lo, hi = np.percentile(img_n, [3, 97])
+    img_c = np.clip((img_n-lo)/(hi-lo+1e-12),0,1)
+    return img_c**(1/1.05)
+
+def robust_spatial_norm(img, mask):
+    vals = img[mask]
+    med = np.median(vals)
+    mad = np.median(np.abs(vals-med))+1e-12
+    z = (img-med)/mad
+    z = np.clip(z,-3,3)
+    out = (z+3)/6
+    out[~mask] = 0
+    return out
+
+# QUALITY GUARD
+def compute_cnr(sig, ref, mask):
+    s = sig[mask]; r = ref[mask]
+    return (s.mean()-r.mean())/(r.std()+1e-9)
+
+def quality_guard(ie, ifreq, ispat, mask, alpha_s):
+    best = None
+    a = alpha_s
+    while a >= ALPHA_MIN_SAFETY:
+        blend = ispat.copy()
+        blend[mask] = a*ifreq[mask] + (1-a)*ispat[mask]
+        psnr = peak_signal_noise_ratio(ie[mask], blend[mask], data_range=1)
+        ssim = structural_similarity(ie, blend, data_range=1)
+        cnr  = compute_cnr(blend, ie, mask)
+        if psnr>=PSNR_MIN and ssim>=SSIM_MIN and cnr>=CNR_MIN:
+            return blend, a, psnr, ssim, cnr, "OK"
+        if best is None or psnr+ssim*10+cnr > best[0]:
+            best = (psnr+ssim*10+cnr, blend, a, psnr, ssim, cnr)
+        a -= DELTA_ALPHA
+    if best:
+        _, img, a, psnr, ssim, cnr = best
+        return img, a, psnr, ssim, cnr, "ROLLBACK"
+    return ispat, 0.0, np.nan, np.nan, np.nan, "FAIL"
+
+# SITE DHI
+def _norm_text(s: str) -> str:
+    return (s or "").upper().replace("_", " ").replace("-", " ")
+
+SITE_CANON_MAP = { 
+    "RS PARU DR ARIO WIRAWAN SALATIGA": "RS Paru dr. Ario Wirawan",
+    "RS PARU DR. ARIO WIRAWAN": "RS Paru dr. Ario Wirawan",
+    "RS PARU DR ARIO WIRAWAN": "RS Paru dr. Ario Wirawan",
+    "RS PARU DR ARIO WIRAWAN ": "RS Paru dr. Ario Wirawan",
+    "RSP DR. ARIO WIRAWAN": "RS Paru dr. Ario Wirawan",
+}
+
+def canonicalize_site_id(raw: str) -> str:
+    if not raw or not raw.strip():
+        return "RS Paru dr. Ario Wirawan"
+
+    s_norm = _norm_text(raw).strip()
+
+    if s_norm in SITE_CANON_MAP:
+        return SITE_CANON_MAP[s_norm]
+
+    if "ARIO WIRAWAN" in s_norm and "PARU" in s_norm:
+        return "RS Paru dr. Ario Wirawan"
+
+    return raw.strip()
+
+def get_site_id(ds) -> str:
+    for tag in ["InstitutionName", "StationName", "ManufacturerModelName", "Manufacturer"]:
+        val = getattr(ds, tag, None)
+        if val not in (None, ""):
+            return canonicalize_site_id(str(val))
+    return "RS Paru dr. Ario Wirawan"
+
+def compute_site_dhi(
+    dicom_paths,
+    alpha_min=ALPHA_MIN,
+    alpha_max=ALPHA_MAX,
+    eps=1e-6,
+    save_dir=MAN_ROOT
+):
+    records = []
+
+    # Collect per-image metadata & intensity
+    for p in tqdm(dicom_paths, desc="Collecting DHI metadata"):
+        try:
+            ds = pydicom.dcmread(p)
+        except Exception:
+            continue
+
+        site = get_site_id(ds)
+
+        # ---- Bit depth ----
+        bits = getattr(ds, "BitsStored", None)
+        try:
+            bits = int(bits) if bits is not None else None
+        except Exception:
+            bits = None
+
+        # ---- Pixel spacing ----
+        d = None
+        pxs = getattr(ds, "PixelSpacing", None)
+        if pxs is not None and len(pxs) >= 2:
+            try:
+                dx = float(pxs[0])
+                dy = float(pxs[1])
+                d = 0.5 * (dx + dy)
+            except Exception:
+                d = None
+
+        # ---- Image size ----
+        rows = getattr(ds, "Rows", None)
+        cols = getattr(ds, "Columns", None)
+        try:
+            A = int(rows) * int(cols)
+        except Exception:
+            A = None
+
+        m_i = None
+        try:
+            raw = apply_voi_lut(ds.pixel_array, ds)
+            img = extract_2d(raw).astype(np.float32)
+            if needs_inversion(ds, img):
+                img = img.max() - img
+            mn, mx = img.min(), img.max()
+            if mx - mn > 1e-12:
+                ie = (img - mn) / (mx - mn)
+                mask = ie > BG_THRESHOLD
+                if mask.sum() >= max(1, MIN_CONTENT_FRAC * ie.size):
+                    m_i = float(np.mean(ie[mask]))
+                else:
+                    m_i = float(np.mean(ie))
+        except Exception:
+            m_i = None
+
+        records.append({
+            "site": site,
+            "BitsStored": bits,
+            "spacing": d,
+            "area": A,
+            "intensity_mean": m_i,
+        })
+
+    df = pd.DataFrame(records)
+
+    # Compute DHI components per site
+    site_rows = []
+
+    for site, g in df.groupby("site"):
+        N = len(g)
+
+        # ---- H_bitdepth (dominance-based) ----
+        bs = g["BitsStored"].dropna()
+        if len(bs) > 0:
+            dom = bs.value_counts().max()
+            H_bit = 1.0 - (dom / len(bs))
+        else:
+            H_bit = 0.0
+
+        # ---- H_spacing (CV) ----
+        dvals = g["spacing"].dropna()
+        if len(dvals) > 1 and dvals.mean() > 0:
+            H_spacing = min(dvals.std() / (dvals.mean() + eps), 1.0)
+        else:
+            H_spacing = 0.0
+
+        # ---- H_size (CV of area) ----
+        Avals = g["area"].dropna()
+        if len(Avals) > 1 and Avals.mean() > 0:
+            H_size = min(Avals.std() / (Avals.mean() + eps), 1.0)
+        else:
+            H_size = 0.0
+
+        # ---- H_intensity (CV of Ie mean) ----
+        ivals = g["intensity_mean"].dropna()
+        if len(ivals) > 1 and ivals.mean() > 0:
+            H_int = min(ivals.std() / (ivals.mean() + eps), 1.0)
+        else:
+            H_int = 0.0
+
+        # ---- Final DHI ----
+        DHI = (H_bit + H_spacing + H_size + H_int) / 4.0
+
+        alpha_s = alpha_min + (alpha_max - alpha_min) * DHI
+
+        site_rows.append({
+            "site": site,
+            "N_images": N,
+            "H_bitdepth": H_bit,
+            "H_spacing": H_spacing,
+            "H_size": H_size,
+            "H_intensity": H_int,
+            "DHI": DHI,
+            "alpha_s": alpha_s,
+        })
+
+    df_site = pd.DataFrame(site_rows)
+
+    # Save CSVs
+    os.makedirs(save_dir, exist_ok=True)
+
+    df_site.to_csv(
+        os.path.join(save_dir, "site_dhi_components.csv"),
+        index=False
+    )
+
+    SITE_ALPHA = dict(zip(df_site["site"], df_site["alpha_s"]))
+
+    return SITE_ALPHA, df_site
+
+# ... (Imports, Config, dan Fungsi Utils tetap sama seperti sebelumnya) ...
+
+# ==========================================
+# SETUP DIREKTORI BERDASARKAN KOMPONEN
+# ==========================================
+COMPONENTS = ["hyfusion", "freq", "spatial"]
+
+# Membuat struktur folder untuk NPY dan PNG
+for comp in COMPONENTS:
+    # Buat folder NPY/hyfusion, NPY/freq, NPY/spatial
+    os.makedirs(os.path.join(NPY_ROOT, comp), exist_ok=True)
+    
+    # Buat folder PNG/hyfusion/train/TB, dll
+    for split in ["train", "val", "test"]:
+        for cls in ["TB", "NonTB"]:
+            os.makedirs(os.path.join(PNG_ROOT, comp, split, cls), exist_ok=True)
+
+# File Log
+with open(LOG_PATH, "w") as f:
+    f.write("# HyFusion-v2 Component-based Log\n")
+
+# ==========================================
+# MAIN PIPELINE
+# ==========================================
+manifest = []
+all_paths = []
+
+# 1. PRE-CALCULATE DHI (Site Variance)
+print("Computing DHI Site Variance...")
+for split in ["train", "val", "test"]:
+    for cls in ["TB", "NonTB"]:
+        d = os.path.join(ROOT_SPLIT, split, cls)
+        if os.path.exists(d):
+            all_paths += [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".dcm")]
+
+SITE_ALPHA, df_site = compute_site_dhi(all_paths)
+df_site.to_csv(os.path.join(MAN_ROOT, "site_variance.csv"), index=False)
+
+print("Starting processing...")
+
+for split in ["train", "val", "test"]:
+    X_hyf  = []
+    X_freq = []
+    X_spat = []
+    y = []
+    
+    print(f"Processing split: {split}")
+
+    for cls, yv in [("TB", 1), ("NonTB", 0)]:
+        src = os.path.join(ROOT_SPLIT, split, cls)
+        
+        if not os.path.exists(src):
+            continue
+
+        for f in tqdm(os.listdir(src), desc=f"{split}-{cls}"):
+            if not f.endswith(".dcm"): continue
+            
+            p = os.path.join(src, f)
+            try:
+                # --- READ & PREPROCESS ---
+                ds = pydicom.dcmread(p)
+                raw = apply_voi_lut(ds.pixel_array, ds)
+                img = extract_2d(raw)
+                
+                if needs_inversion(ds, img): 
+                    img = img.max() - img
+                
+                ie = (img - img.min()) / (img.max() - img.min() + 1e-12)
+                mask = ie > BG_THRESHOLD
+
+                # 1. Frequency
+                ifreq = adaptive_gamma(homomorphic_filter(ie))
+                # 2. Spatial
+                ispat = robust_spatial_norm(ifreq, mask)
+                # 3. HyFusion
+                alpha = SITE_ALPHA.get(get_site_id(ds), ALPHA_MIN)
+                ihyf, a_f, psnr, ssim, cnr, status = quality_guard(ie, ifreq, ispat, mask, alpha)
+                
+                # --- LOGGING ROLLBACK ---
+                if status != "OK":
+                    with open(LOG_PATH, "a") as f_log:
+                        f_log.write(f"{p} | {split} | {cls} | site={get_site_id(ds)} | status={status}\n")
+
+                # --- PADDING TO 1024 ---
+                ihyf_1024, _, pad_info = pad_to_1024(ihyf)
+                ifreq_1024, _, _ = pad_to_1024(ifreq)
+                ispat_1024, _, _ = pad_to_1024(ispat)
+
+                # --- SAVE PNG (VISUALIZATION) ---
+                base_name = os.path.splitext(os.path.basename(p))[0] + ".png"
+                
+                # Path tujuan
+                path_hyf  = os.path.join(PNG_ROOT, "hyfusion", split, cls, base_name)
+                path_freq = os.path.join(PNG_ROOT, "freq", split, cls, base_name)
+                path_spat = os.path.join(PNG_ROOT, "spatial", split, cls, base_name)
+
+                # Save Images
+                cv2.imwrite(path_hyf,  np.clip(ihyf_1024 * 255.0, 0, 255).astype(np.uint8))
+                cv2.imwrite(path_freq, np.clip(ifreq_1024 * 255.0, 0, 255).astype(np.uint8))
+                cv2.imwrite(path_spat, np.clip(ispat_1024 * 255.0, 0, 255).astype(np.uint8))
+
+                # --- APPEND TO LISTS (NPY) ---
+                X_hyf.append(ihyf_1024[..., None])
+                X_freq.append(ifreq_1024[..., None])
+                X_spat.append(ispat_1024[..., None])
+                y.append(yv)
+
+                # --- UPDATE MANIFEST ---
+                manifest.append({
+                    "split": split,
+                    "label": cls,
+                    "src_dicom": p,
+                    "path_hyfusion": path_hyf,
+                    "path_freq": path_freq,
+                    "path_spatial": path_spat,
+                    "site": get_site_id(ds),
+                    "status": status,
+                    "alpha_final": a_f
+                })
+
+            except Exception as e:
+                print(f"Error processing {p}: {e}")
+                continue
+
+    if len(y) > 0:
+        print(f"Saving NPYs for {split}...")
+        
+        y_arr = np.array(y, np.int64)
+
+        # 1. Save HYFUSION
+        np.save(os.path.join(NPY_ROOT, "hyfusion", f"X_{split}.npy"), np.array(X_hyf, np.float32))
+        np.save(os.path.join(NPY_ROOT, "hyfusion", f"y_{split}.npy"), y_arr) # Simpan label juga disini
+        
+        # 2. Save FREQUENCY
+        np.save(os.path.join(NPY_ROOT, "freq", f"X_{split}.npy"), np.array(X_freq, np.float32))
+        np.save(os.path.join(NPY_ROOT, "freq", f"y_{split}.npy"), y_arr)     # Simpan label juga disini
+        
+        # 3. Save SPATIAL
+        np.save(os.path.join(NPY_ROOT, "spatial", f"X_{split}.npy"), np.array(X_spat, np.float32))
+        np.save(os.path.join(NPY_ROOT, "spatial", f"y_{split}.npy"), y_arr)  # Simpan label juga disini
+        
+        print(f"Saved {len(y)} samples to hyfusion/, freq/, and spatial/ folders.")
+    else:
+        print(f"Warning: No data for split {split}")
+
+# SAVE MANIFEST
+pd.DataFrame(manifest).to_csv(os.path.join(MAN_ROOT, "hyfusion_manifest_separated.csv"), index=False)
+print("[DONE] Pipeline completed. Folders organized by component.")
