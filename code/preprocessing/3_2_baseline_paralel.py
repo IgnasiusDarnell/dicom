@@ -97,7 +97,6 @@ def resize_with_padding(img, target=1024):
 
 # MAIN
 manifest_rows = []
-
 for split in SPLITS:
     print(f"\n[INFO] Processing split: {split}")
 
@@ -106,7 +105,6 @@ for split in SPLITS:
     for label_name, y_val in LABELS.items():
         src_dir = os.path.join(SPLIT_ROOT, split, label_name)
         png_dir = os.path.join(PNG_ROOT, split, label_name)
-
         os.makedirs(png_dir, exist_ok=True)
 
         files = [f for f in os.listdir(src_dir) if f.lower().endswith(".dcm")]
@@ -127,7 +125,7 @@ for split in SPLITS:
             cv2.imwrite(png_path, (img_pad * 255).astype(np.uint8))
 
             # --- SAVE FOR NPY ---
-            X_list.append(img_pad[..., None]) 
+            X_list.append(img_pad[..., None])  # (1024,1024,1)
             y_list.append(y_val)
 
             # --- MANIFEST ---
@@ -146,15 +144,16 @@ for split in SPLITS:
                 "final_size": TARGET_SIZE
             })
 
-    # --- SAVE NPY ---
+    # SAVE NPY 
     X = np.stack(X_list).astype(np.float32)
     y = np.array(y_list).astype(np.int64)
 
-    npy_dir = os.path.join(NPY_ROOT, split)
-    os.makedirs(npy_dir, exist_ok=True)
+    os.makedirs(NPY_ROOT, exist_ok=True)
 
-    np.save(os.path.join(npy_dir, "X.npy"), X)
-    np.save(os.path.join(npy_dir, "y.npy"), y)
+    np.save(os.path.join(NPY_ROOT, f"X_{split}.npy"), X)
+    np.save(os.path.join(NPY_ROOT, f"y_{split}.npy"), y)
+
+    print(f"[OK] Saved X_{split}.npy & y_{split}.npy | shape={X.shape}")
 
 # SAVE MANIFEST
 manifest_path = os.path.join(MANIFEST_ROOT, "baseline_manifest.csv")

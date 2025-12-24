@@ -121,7 +121,7 @@ for split in SPLITS:
             png_path = os.path.join(png_dir, png_name)
             cv2.imwrite(png_path, img_u8)
 
-            # PNG → NPY 
+            # ---- PNG → NPY 
             png_loaded = cv2.imread(png_path, cv2.IMREAD_GRAYSCALE)
             img_npy = (png_loaded.astype(np.float32) / 255.0)[..., None]
 
@@ -146,15 +146,17 @@ for split in SPLITS:
                 "baseline_range": "0-255"
             })
 
-    # ---- SAVE NPY PER SPLIT ----
+    # SAVE NPY 
     X = np.stack(X_list).astype(np.float32)
     y = np.array(y_list).astype(np.int64)
 
-    npy_dir = os.path.join(NPY_ROOT, split)
-    os.makedirs(npy_dir, exist_ok=True)
+    os.makedirs(NPY_ROOT, exist_ok=True)
 
-    np.save(os.path.join(npy_dir, "X.npy"), X)
-    np.save(os.path.join(npy_dir, "y.npy"), y)
+    np.save(os.path.join(NPY_ROOT, f"X_{split}.npy"), X)
+    np.save(os.path.join(NPY_ROOT, f"y_{split}.npy"), y)
+
+    print(f"[OK] Saved X_{split}.npy & y_{split}.npy | shape={X.shape}")
+
 
 # SAVE MANIFEST 
 manifest_path = os.path.join(MANIFEST_ROOT, "baseline_manifest.csv")
