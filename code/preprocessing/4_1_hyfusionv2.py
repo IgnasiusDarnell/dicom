@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# IMPORTS
 import os, json, math, csv
 import numpy as np
 import pandas as pd
@@ -41,7 +40,7 @@ NPY_ROOT   = os.path.join(OUT_ROOT, "NPY")
 PNG_ROOT   = os.path.join(OUT_ROOT, "PNG")
 MAN_ROOT   = os.path.join(OUT_ROOT, "manifest")
 LOG_PATH = os.path.join(MAN_ROOT, "log.txt")
-
+INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt") # [NEW] Path log inversion
 
 for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
     os.makedirs(p, exist_ok=True)
@@ -49,12 +48,13 @@ for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
 with open(LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Rollback Log\n")
 
+with open(INVERSION_LOG_PATH, "w") as f:
+    f.write("# HyFusion-v2 Inversion Log (List of Inverted Files)\n")
+
 for split in ["train", "val", "test"]:
     for cls in ["TB", "NonTB"]:
         os.makedirs(os.path.join(PNG_ROOT, split, cls), exist_ok=True)
 
-
-# UTIL — CORE
 def extract_2d(img):
     img = np.asarray(img)
     if img.ndim == 2:
@@ -79,7 +79,7 @@ def needs_inversion(ds, img):
     h, w = img.shape
     b = max(1, int(min(h, w) * 0.05))
     border = np.concatenate([img[:b, :].ravel(), img[-b:, :].ravel(),
-                              img[:, :b].ravel(), img[:, -b:].ravel()])
+                             img[:, :b].ravel(), img[:, -b:].ravel()])
     return float(border.mean()) > float(np.median(img))
 
 def pad_to_1024(img: np.ndarray):
@@ -363,7 +363,8 @@ all_paths=[]
 for split in ["train","val","test"]:
     for cls in ["TB","NonTB"]:
         d=os.path.join(ROOT_SPLIT,split,cls)
-        all_paths += [os.path.join(d,f) for f in os.listdir(d) if f.endswith(".dcm")]
+        if os.path.exists(d):
+            all_paths += [os.path.join(d,f) for f in os.listdir(d) if f.endswith(".dcm")]
 
 SITE_ALPHA, df_site = compute_site_dhi(all_paths)
 df_site.to_csv(os.path.join(MAN_ROOT,"site_variance.csv"),index=False)
@@ -372,78 +373,96 @@ for split in ["train","val","test"]:
     X=[]; y=[]
     for cls,yv in [("TB",1),("NonTB",0)]:
         src=os.path.join(ROOT_SPLIT,split,cls)
+        if not os.path.exists(src): continue
+        
         for f in tqdm(os.listdir(src), desc=f"{split}-{cls}"):
             if not f.endswith(".dcm"): continue
             p=os.path.join(src,f)
-            ds=pydicom.dcmread(p)
-            raw=apply_voi_lut(ds.pixel_array,ds)
-            img=extract_2d(raw)
-            if needs_inversion(ds,img): img=img.max()-img
-            ie=(img-img.min())/(img.max()-img.min()+1e-12)
-            mask=ie>BG_THRESHOLD
+            try:
+                ds=pydicom.dcmread(p)
+                raw=apply_voi_lut(ds.pixel_array,ds)
+                img=extract_2d(raw)
+                
+                # [MODIFIED] INVERSION LOGIC
+                is_inverted = needs_inversion(ds, img)
+                if is_inverted:
+                    img = img.max() - img
+                    # [NEW] Log to inversion text file
+                    with open(INVERSION_LOG_PATH, "a") as f_inv:
+                        f_inv.write(f"{p}\n")
 
-            ifreq=adaptive_gamma(homomorphic_filter(ie))
-            ispat=robust_spatial_norm(ifreq,mask)
+                ie=(img-img.min())/(img.max()-img.min()+1e-12)
+                mask=ie>BG_THRESHOLD
 
-            alpha=SITE_ALPHA.get(get_site_id(ds),ALPHA_MIN)
-            ihyf,a_f,psnr,ssim,cnr,status=quality_guard(ie,ifreq,ispat,mask,alpha)
-            
-            # ---------- LOG ROLLBACK ----------
-            if status != "OK":
-                with open(LOG_PATH, "a") as f:
-                    f.write(
-                        f"{p} | "
-                        f"split={split} | label={cls} | site={get_site_id(ds)} | "
-                        f"alpha_s={alpha:.3f} | alpha_final={a_f:.3f} | "
-                        f"psnr={psnr:.3f} | ssim={ssim:.3f} | cnr={cnr:.3f} | "
-                        f"status={status}\n"
-                    )
+                ifreq=adaptive_gamma(homomorphic_filter(ie))
+                ispat=robust_spatial_norm(ifreq,mask)
 
-            # log explicit rollback-to-zero
-            if status != "OK" and a_f <= 0.0:
-                with open(LOG_PATH, "a") as f:
-                    f.write(
-                        f"[ROLLBACK_TO_ZERO] {p} | "
-                        f"split={split} | label={cls} | site={get_site_id(ds)}\n"
-                    )
+                alpha=SITE_ALPHA.get(get_site_id(ds),ALPHA_MIN)
+                ihyf,a_f,psnr,ssim,cnr,status=quality_guard(ie,ifreq,ispat,mask,alpha)
+                
+                # ---------- LOG ROLLBACK ----------
+                if status != "OK":
+                    with open(LOG_PATH, "a") as f:
+                        f.write(
+                            f"{p} | "
+                            f"split={split} | label={cls} | site={get_site_id(ds)} | "
+                            f"alpha_s={alpha:.3f} | alpha_final={a_f:.3f} | "
+                            f"psnr={psnr:.3f} | ssim={ssim:.3f} | cnr={cnr:.3f} | "
+                            f"status={status}\n"
+                        )
 
-            ihyf_1024, valid_mask_1024, pad_info = pad_to_1024(ihyf)
+                # log explicit rollback-to-zero
+                if status != "OK" and a_f <= 0.0:
+                    with open(LOG_PATH, "a") as f:
+                        f.write(
+                            f"[ROLLBACK_TO_ZERO] {p} | "
+                            f"split={split} | label={cls} | site={get_site_id(ds)}\n"
+                        )
 
-            # ---------- SAVE PNG ----------
-            png_name = os.path.splitext(os.path.basename(p))[0] + ".png"
-            png_path = os.path.join(PNG_ROOT, split, cls, png_name)
+                ihyf_1024, valid_mask_1024, pad_info = pad_to_1024(ihyf)
 
-            png_u8 = np.clip(ihyf_1024 * 255.0, 0, 255).astype(np.uint8)
-            cv2.imwrite(png_path, png_u8)
+                # ---------- SAVE PNG ----------
+                png_name = os.path.splitext(os.path.basename(p))[0] + ".png"
+                png_path = os.path.join(PNG_ROOT, split, cls, png_name)
 
-            X.append(ihyf_1024[...,None])
-            y.append(yv)
+                png_u8 = np.clip(ihyf_1024 * 255.0, 0, 255).astype(np.uint8)
+                cv2.imwrite(png_path, png_u8)
 
-            manifest.append({
-            "split": split,
-            "label": cls,
-            "src_dicom": p,
-            "png_path": png_path,
-            "site": get_site_id(ds),
+                X.append(ihyf_1024[...,None])
+                y.append(yv)
 
-            "alpha_s": alpha,
-            "alpha_final": a_f,
-            "psnr": psnr,
-            "ssim": ssim,
-            "cnr": cnr,
-            "status": status,
+                manifest.append({
+                    "split": split,
+                    "label": cls,
+                    "src_dicom": p,
+                    "png_path": png_path,
+                    "site": get_site_id(ds),
 
-            "pad_top": pad_info["pad_top"],
-            "pad_bottom": pad_info["pad_bottom"],
-            "pad_left": pad_info["pad_left"],
-            "pad_right": pad_info["pad_right"],
-            "scale_factor": pad_info["scale"],
-            "scaled_h": pad_info["scaled_h"],
-            "scaled_w": pad_info["scaled_w"],
-        })
+                    "alpha_s": alpha,
+                    "alpha_final": a_f,
+                    "psnr": psnr,
+                    "ssim": ssim,
+                    "cnr": cnr,
+                    "status": status,
+                    "inverted": is_inverted, 
 
-    np.save(os.path.join(NPY_ROOT,f"X_{split}.npy"),np.array(X,np.float32))
-    np.save(os.path.join(NPY_ROOT,f"y_{split}.npy"),np.array(y,np.int64))
+                    "pad_top": pad_info["pad_top"],
+                    "pad_bottom": pad_info["pad_bottom"],
+                    "pad_left": pad_info["pad_left"],
+                    "pad_right": pad_info["pad_right"],
+                    "scale_factor": pad_info["scale"],
+                    "scaled_h": pad_info["scaled_h"],
+                    "scaled_w": pad_info["scaled_w"],
+                })
+            except Exception as e:
+                print(f"Error processing {p}: {e}")
+                continue
+
+    if len(X) > 0:
+        np.save(os.path.join(NPY_ROOT,f"X_{split}.npy"),np.array(X,np.float32))
+        np.save(os.path.join(NPY_ROOT,f"y_{split}.npy"),np.array(y,np.int64))
+    else:
+        print(f"No data for split: {split}")
 
 # SAVE MANIFEST
 pd.DataFrame(manifest).to_csv(os.path.join(MAN_ROOT,"hyfusion_manifest.csv"),index=False)
@@ -451,16 +470,19 @@ pd.DataFrame(manifest).to_csv(os.path.join(MAN_ROOT,"hyfusion_manifest.csv"),ind
 # ---------- SUMMARY ----------
 df_m = pd.DataFrame(manifest)
 
-n_total = len(df_m)
-n_ok = (df_m["status"] == "OK").sum()
-n_rb = (df_m["status"] != "OK").sum()
-n_rb0 = (df_m["alpha_final"] <= 0.0).sum()
+if not df_m.empty:
+    n_total = len(df_m)
+    n_ok = (df_m["status"] == "OK").sum()
+    n_rb = (df_m["status"] != "OK").sum()
+    n_rb0 = (df_m["alpha_final"] <= 0.0).sum()
+    n_inverted = df_m["inverted"].sum() 
 
-with open(LOG_PATH, "a") as f:
-    f.write("\n# SUMMARY\n")
-    f.write(f"Total files       : {n_total}\n")
-    f.write(f"OK                : {n_ok}\n")
-    f.write(f"Rollback          : {n_rb}\n")
-    f.write(f"Rollback to zero  : {n_rb0}\n")
+    with open(LOG_PATH, "a") as f:
+        f.write("\n# SUMMARY\n")
+        f.write(f"Total files       : {n_total}\n")
+        f.write(f"OK                : {n_ok}\n")
+        f.write(f"Rollback          : {n_rb}\n")
+        f.write(f"Rollback to zero  : {n_rb0}\n")
+        f.write(f"Inverted Files    : {n_inverted}\n")
 
 print("[DONE] HyFusion-v2 pipeline completed.")

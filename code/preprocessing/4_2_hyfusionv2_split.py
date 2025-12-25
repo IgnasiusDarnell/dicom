@@ -41,13 +41,18 @@ NPY_ROOT   = os.path.join(OUT_ROOT, "NPY")
 PNG_ROOT   = os.path.join(OUT_ROOT, "PNG")
 MAN_ROOT   = os.path.join(OUT_ROOT, "manifest")
 LOG_PATH = os.path.join(MAN_ROOT, "log.txt")
-
+INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt") # [NEW] Path log inversion
 
 for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
     os.makedirs(p, exist_ok=True)
 
+# Reset Main Log
 with open(LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Rollback Log\n")
+
+# [NEW] Reset Inversion Log
+with open(INVERSION_LOG_PATH, "w") as f:
+    f.write("# HyFusion-v2 Inversion Log (List of Inverted Files)\n")
 
 for split in ["train", "val", "test"]:
     for cls in ["TB", "NonTB"]:
@@ -79,7 +84,7 @@ def needs_inversion(ds, img):
     h, w = img.shape
     b = max(1, int(min(h, w) * 0.05))
     border = np.concatenate([img[:b, :].ravel(), img[-b:, :].ravel(),
-                              img[:, :b].ravel(), img[:, -b:].ravel()])
+                             img[:, :b].ravel(), img[:, -b:].ravel()])
     return float(border.mean()) > float(np.median(img))
 
 def pad_to_1024(img: np.ndarray):
@@ -355,11 +360,7 @@ def compute_site_dhi(
 
     return SITE_ALPHA, df_site
 
-# ... (Imports, Config, dan Fungsi Utils tetap sama seperti sebelumnya) ...
-
-# ==========================================
 # SETUP DIREKTORI BERDASARKAN KOMPONEN
-# ==========================================
 COMPONENTS = ["hyfusion", "freq", "spatial"]
 
 # Membuat struktur folder untuk NPY dan PNG
@@ -376,9 +377,7 @@ for comp in COMPONENTS:
 with open(LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Component-based Log\n")
 
-# ==========================================
 # MAIN PIPELINE
-# ==========================================
 manifest = []
 all_paths = []
 
@@ -419,8 +418,12 @@ for split in ["train", "val", "test"]:
                 raw = apply_voi_lut(ds.pixel_array, ds)
                 img = extract_2d(raw)
                 
-                if needs_inversion(ds, img): 
+                is_inverted = needs_inversion(ds, img)
+                if is_inverted: 
                     img = img.max() - img
+                    # Log file inversion
+                    with open(INVERSION_LOG_PATH, "a") as f_inv:
+                        f_inv.write(f"{p}\n")
                 
                 ie = (img - img.min()) / (img.max() - img.min() + 1e-12)
                 mask = ie > BG_THRESHOLD
@@ -443,10 +446,9 @@ for split in ["train", "val", "test"]:
                 ifreq_1024, _, _ = pad_to_1024(ifreq)
                 ispat_1024, _, _ = pad_to_1024(ispat)
 
-                # --- SAVE PNG (VISUALIZATION) ---
+                # --- SAVE PNG  ---
                 base_name = os.path.splitext(os.path.basename(p))[0] + ".png"
                 
-                # Path tujuan
                 path_hyf  = os.path.join(PNG_ROOT, "hyfusion", split, cls, base_name)
                 path_freq = os.path.join(PNG_ROOT, "freq", split, cls, base_name)
                 path_spat = os.path.join(PNG_ROOT, "spatial", split, cls, base_name)
@@ -472,7 +474,8 @@ for split in ["train", "val", "test"]:
                     "path_spatial": path_spat,
                     "site": get_site_id(ds),
                     "status": status,
-                    "alpha_final": a_f
+                    "alpha_final": a_f,
+                    "inverted": is_inverted 
                 })
 
             except Exception as e:
@@ -486,15 +489,15 @@ for split in ["train", "val", "test"]:
 
         # 1. Save HYFUSION
         np.save(os.path.join(NPY_ROOT, "hyfusion", f"X_{split}.npy"), np.array(X_hyf, np.float32))
-        np.save(os.path.join(NPY_ROOT, "hyfusion", f"y_{split}.npy"), y_arr) # Simpan label juga disini
+        np.save(os.path.join(NPY_ROOT, "hyfusion", f"y_{split}.npy"), y_arr) 
         
         # 2. Save FREQUENCY
         np.save(os.path.join(NPY_ROOT, "freq", f"X_{split}.npy"), np.array(X_freq, np.float32))
-        np.save(os.path.join(NPY_ROOT, "freq", f"y_{split}.npy"), y_arr)     # Simpan label juga disini
+        np.save(os.path.join(NPY_ROOT, "freq", f"y_{split}.npy"), y_arr)     
         
         # 3. Save SPATIAL
         np.save(os.path.join(NPY_ROOT, "spatial", f"X_{split}.npy"), np.array(X_spat, np.float32))
-        np.save(os.path.join(NPY_ROOT, "spatial", f"y_{split}.npy"), y_arr)  # Simpan label juga disini
+        np.save(os.path.join(NPY_ROOT, "spatial", f"y_{split}.npy"), y_arr)  
         
         print(f"Saved {len(y)} samples to hyfusion/, freq/, and spatial/ folders.")
     else:

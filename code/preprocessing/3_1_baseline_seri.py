@@ -19,9 +19,13 @@ BASELINE_ROOT = "../../dataset/baseline"
 PNG_ROOT = os.path.join(BASELINE_ROOT, "PNG")
 NPY_ROOT = os.path.join(BASELINE_ROOT, "NPY")
 MANIFEST_ROOT = os.path.join(BASELINE_ROOT, "manifest")
+INVERSION_LOG_PATH = os.path.join(MANIFEST_ROOT, "log_inversion.txt") # [NEW] Path log inversion
 
 for p in [PNG_ROOT, NPY_ROOT, MANIFEST_ROOT]:
     os.makedirs(p, exist_ok=True)
+
+with open(INVERSION_LOG_PATH, "w") as f:
+    f.write("# Baseline Inversion Log (List of Inverted Files)\n")
 
 SPLITS = ["train", "val", "test"]
 LABELS = {"TB": 1, "NonTB": 0}
@@ -47,6 +51,18 @@ def extract_2d(img):
         return img[0, ..., 0].astype(np.float32)
 
     return np.squeeze(img).astype(np.float32)
+
+def needs_inversion(ds, img):
+    pi = getattr(ds, "PhotometricInterpretation", None)
+    if pi == "MONOCHROME1":
+        return True
+    if pi == "MONOCHROME2":
+        return False
+    h, w = img.shape
+    b = max(1, int(min(h, w) * 0.05))
+    border = np.concatenate([img[:b, :].ravel(), img[-b:, :].ravel(),
+                             img[:, :b].ravel(), img[:, -b:].ravel()])
+    return float(border.mean()) > float(np.median(img))
 
 
 def resize_with_padding_uint8(img, target=1024):
@@ -108,6 +124,13 @@ for split in SPLITS:
 
             img = extract_2d(img)
 
+            is_inverted = needs_inversion(ds, img)
+            if is_inverted:
+                img = np.max(img) - img
+                # Log to inversion text file
+                with open(INVERSION_LOG_PATH, "a") as f_inv:
+                    f_inv.write(f"{dcm_path}\n")
+
             # ---- NORMALIZE TO [0,255] ----
             mn, mx = img.min(), img.max()
             img = (img - mn) / (mx - mn) if mx > mn else np.zeros_like(img)
@@ -143,28 +166,38 @@ for split in SPLITS:
                 "pad_left": pads[2],
                 "pad_right": pads[3],
                 "final_size": TARGET_SIZE,
-                "baseline_range": "0-255"
+                "baseline_range": "0-255",
+                "inverted": is_inverted  
             })
 
     # SAVE NPY 
-    X = np.stack(X_list).astype(np.float32)
-    y = np.array(y_list).astype(np.int64)
+    if len(X_list) > 0:
+        X = np.stack(X_list).astype(np.float32)
+        y = np.array(y_list).astype(np.int64)
 
-    os.makedirs(NPY_ROOT, exist_ok=True)
+        os.makedirs(NPY_ROOT, exist_ok=True)
 
-    np.save(os.path.join(NPY_ROOT, f"X_{split}.npy"), X)
-    np.save(os.path.join(NPY_ROOT, f"y_{split}.npy"), y)
+        np.save(os.path.join(NPY_ROOT, f"X_{split}.npy"), X)
+        np.save(os.path.join(NPY_ROOT, f"y_{split}.npy"), y)
 
-    print(f"[OK] Saved X_{split}.npy & y_{split}.npy | shape={X.shape}")
+        print(f"[OK] Saved X_{split}.npy & y_{split}.npy | shape={X.shape}")
+    else:
+        print(f"[WARN] No data for split {split}")
 
 
 # SAVE MANIFEST 
-manifest_path = os.path.join(MANIFEST_ROOT, "baseline_manifest.csv")
+if manifest_rows:
+    manifest_path = os.path.join(MANIFEST_ROOT, "baseline_manifest.csv")
+    
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=manifest_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(manifest_rows)
 
-with open(manifest_path, "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=manifest_rows[0].keys())
-    writer.writeheader()
-    writer.writerows(manifest_rows)
+    print(f"\n[OK] Baseline manifest saved: {manifest_path}")
 
-print(f"\n[OK] Baseline manifest saved: {manifest_path}")
+    # Summary Log
+    n_inverted = sum(1 for row in manifest_rows if row["inverted"])
+    print(f"[INFO] Total Inverted Files: {n_inverted}")
+    
 print("\n[DONE] DICOM → PNG → NPY pipeline completed successfully.")
