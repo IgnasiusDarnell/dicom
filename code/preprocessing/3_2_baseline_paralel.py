@@ -58,16 +58,25 @@ def extract_2d(img):
     return np.squeeze(img).astype(np.float32)
 
 def needs_inversion(ds, img):
-    pi = getattr(ds, "PhotometricInterpretation", None)
+    pi = getattr(ds, "PhotometricInterpretation", "").upper()
+
     if pi == "MONOCHROME1":
         return True
     if pi == "MONOCHROME2":
         return False
-    h, w = img.shape
-    b = max(1, int(min(h, w) * 0.05))
-    border = np.concatenate([img[:b, :].ravel(), img[-b:, :].ravel(),
-                             img[:, :b].ravel(), img[:, -b:].ravel()])
-    return float(border.mean()) > float(np.median(img))
+
+    # fallback anatomical heuristic
+    mn, mx = img.min(), img.max()
+    if mx <= mn:
+        return False
+    ie = (img - mn) / (mx - mn)
+
+    fg = ie > 0.05
+    if fg.sum() < 0.1 * ie.size:
+        return False
+
+    return ie[~fg].mean() > ie[fg].mean()
+
 
 def normalize(img):
     mn, mx = img.min(), img.max()
