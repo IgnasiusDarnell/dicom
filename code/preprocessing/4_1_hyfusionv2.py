@@ -51,10 +51,6 @@ with open(LOG_PATH, "w") as f:
 with open(INVERSION_LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Inversion Log (List of Inverted Files)\n")
 
-for split in ["train", "val", "test"]:
-    for cls in ["TB", "NonTB"]:
-        os.makedirs(os.path.join(PNG_ROOT, split, cls), exist_ok=True)
-
 def extract_2d(img):
     img = np.asarray(img)
     if img.ndim == 2:
@@ -367,7 +363,7 @@ for split in ["train","val","test"]:
             all_paths += [os.path.join(d,f) for f in os.listdir(d) if f.endswith(".dcm")]
 
 SITE_ALPHA, df_site = compute_site_dhi(all_paths)
-df_site.to_csv(os.path.join(MAN_ROOT,"site_variance.csv"),index=False)
+# df_site.to_csv(os.path.join(MAN_ROOT,"site_variance.csv"),index=False)
 
 for split in ["train","val","test"]:
     X=[]; y=[]

@@ -41,7 +41,7 @@ NPY_ROOT   = os.path.join(OUT_ROOT, "NPY")
 PNG_ROOT   = os.path.join(OUT_ROOT, "PNG")
 MAN_ROOT   = os.path.join(OUT_ROOT, "manifest")
 LOG_PATH = os.path.join(MAN_ROOT, "log.txt")
-INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt") # [NEW] Path log inversion
+INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt") 
 
 for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
     os.makedirs(p, exist_ok=True)
@@ -50,14 +50,8 @@ for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
 with open(LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Rollback Log\n")
 
-# [NEW] Reset Inversion Log
 with open(INVERSION_LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Inversion Log (List of Inverted Files)\n")
-
-for split in ["train", "val", "test"]:
-    for cls in ["TB", "NonTB"]:
-        os.makedirs(os.path.join(PNG_ROOT, split, cls), exist_ok=True)
-
 
 # UTIL — CORE
 def extract_2d(img):
@@ -390,7 +384,7 @@ for split in ["train", "val", "test"]:
             all_paths += [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".dcm")]
 
 SITE_ALPHA, df_site = compute_site_dhi(all_paths)
-df_site.to_csv(os.path.join(MAN_ROOT, "site_variance.csv"), index=False)
+# df_site.to_csv(os.path.join(MAN_ROOT, "site_variance.csv"), index=False)
 
 print("Starting processing...")
 
