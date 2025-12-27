@@ -41,7 +41,7 @@ MAN_ROOT   = os.path.join(OUT_ROOT, "manifest")
 LOG_PATH = os.path.join(MAN_ROOT, "log_rollback.txt")
 INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt")
 
-# Setup Directories
+# SETUP DIRECTORIES
 COMPONENTS = ["hyfusion", "freq", "spatial"]
 for comp in COMPONENTS:
     os.makedirs(os.path.join(NPY_ROOT, comp), exist_ok=True)
@@ -171,7 +171,7 @@ def robust_spatial_norm(img, mask):
     out[~mask] = 0
     return out
 
-# QUALITY GUARD (FIXED)
+# QUALITY GUARD
 def compute_cnr(sig, ref, mask):
     s = sig[mask]; r = ref[mask]
     return (s.mean()-r.mean())/(r.std()+1e-9)
@@ -217,7 +217,7 @@ def quality_guard(ie, ifreq, ispat, mask, alpha_s):
     
     return img, a, psnr, ssim, cnr, is_rollback
 
-# DHI COMPUTATION 
+# DHI COMPUTATION & SITE ID
 def _norm_text(s: str) -> str:
     return (s or "").upper().replace("_", " ").replace("-", " ")
 
@@ -394,18 +394,39 @@ for split in ["train", "val", "test"]:
                     with open(INVERSION_LOG_PATH, "a") as f_inv:
                         f_inv.write(f"{p}\n")
                 
-                # 3. Preprocess
+                # CAPTURE STATS: ORIGINAL (Post-Inversion)
+                stat_ori_min = float(img.min())
+                stat_ori_max = float(img.max())
+                stat_ori_h, stat_ori_w = img.shape
+                
+                # 3. Preprocess (Normalize 0-1)
                 ie = (img - img.min()) / (img.max() - img.min() + 1e-12)
                 mask = ie > BG_THRESHOLD
 
                 # 4. Filter Components
                 ifreq = adaptive_gamma(homomorphic_filter(ie))
+
+                # CAPTURE STATS: FREQUENCY (Pre-Padding)
+                stat_freq_min = float(ifreq.min())
+                stat_freq_max = float(ifreq.max())
+                stat_freq_h, stat_freq_w = ifreq.shape
+
                 ispat = robust_spatial_norm(ifreq, mask)
+                
+                # CAPTURE STATS: SPATIAL (Pre-Padding)
+                stat_spat_min = float(ispat.min())
+                stat_spat_max = float(ispat.max())
+                stat_spat_h, stat_spat_w = ispat.shape
                 
                 # 5. HyFusion & Quality Guard
                 alpha_site = SITE_ALPHA.get(get_site_id(ds), ALPHA_MIN)
                 ihyf, a_f, psnr, ssim, cnr, is_rollback = quality_guard(ie, ifreq, ispat, mask, alpha_site)
                 
+                # CAPTURE STATS: HYFUSION (Pre-Padding)
+                stat_hyf_min = float(ihyf.min())
+                stat_hyf_max = float(ihyf.max())
+                stat_hyf_h, stat_hyf_w = ihyf.shape
+
                 # Log Rollback
                 if is_rollback:
                     with open(LOG_PATH, "a") as f_log:
@@ -419,8 +440,9 @@ for split in ["train", "val", "test"]:
                 # 7. Metadata
                 freq_pct = a_f * 100
                 spat_pct = (1.0 - a_f) * 100
-                px_min = float(ihyf_1024.min())
-                px_max = float(ihyf_1024.max())
+                
+                px_min_final = float(ihyf_1024.min())
+                px_max_final = float(ihyf_1024.max())
 
                 # 8. Save PNGs (Separated Folders)
                 base_name = os.path.splitext(os.path.basename(p))[0] + ".png"
@@ -453,14 +475,26 @@ for split in ["train", "val", "test"]:
                     "alpha_final": a_f,
                     "freq_pct": f"{freq_pct:.2f}%",
                     "spat_pct": f"{spat_pct:.2f}%",
-                    "orig_h": pad_info["orig_h"],
-                    "orig_w": pad_info["orig_w"],
-                    "pixel_min": px_min,
-                    "pixel_max": px_max,
                     "inverted": is_inverted,
                     "psnr": psnr,
                     "ssim": ssim,
-                    "cnr": cnr
+                    "cnr": cnr,
+
+                    # --- ADDED STATS ---
+                    "ori_h": stat_ori_h, "ori_w": stat_ori_w,
+                    "ori_min": stat_ori_min, "ori_max": stat_ori_max,
+                    
+                    "freq_h": stat_freq_h, "freq_w": stat_freq_w,
+                    "freq_min": stat_freq_min, "freq_max": stat_freq_max,
+                    
+                    "spat_h": stat_spat_h, "spat_w": stat_spat_w,
+                    "spat_min": stat_spat_min, "spat_max": stat_spat_max,
+                    
+                    "hyf_h": stat_hyf_h, "hyf_w": stat_hyf_w,
+                    "hyf_min": stat_hyf_min, "hyf_max": stat_hyf_max,
+                    
+                    "final_pixel_min": px_min_final,
+                    "final_pixel_max": px_max_final
                 })
 
             except Exception as e:
@@ -487,6 +521,7 @@ for split in ["train", "val", "test"]:
     else:
         print(f"Warning: No data for split {split}")
 
+# FINAL LOGGING
 # Save Final Manifest
 pd.DataFrame(manifest).to_csv(os.path.join(MAN_ROOT, "hyfusion_manifest_separated.csv"), index=False)
 
@@ -507,4 +542,4 @@ if not df_m.empty:
         f.write(f"Rollback to zero  : {n_rb0}\n")
         f.write(f"Inverted Files    : {n_inverted}\n")
 
-print("[DONE] HyFusion-v2 Separated Pipeline completed.")
+print("[DONE] HyFusion-v2 completed.")
