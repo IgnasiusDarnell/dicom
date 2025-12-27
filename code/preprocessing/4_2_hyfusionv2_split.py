@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# IMPORTS
 import os, json, math, csv
 import numpy as np
 import pandas as pd
@@ -13,7 +12,7 @@ from tqdm import tqdm
 from pydicom.pixel_data_handlers.util import apply_voi_lut
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-# CONFIG
+# CONFIGURATION
 TARGET_SIZE = 1024
 
 BG_THRESHOLD = 0.05
@@ -22,38 +21,44 @@ MIN_CONTENT_FRAC = 0.15
 SIGMA_HOMO = 30.0
 HIGH_GAIN = 1.5
 LOW_GAIN = 0.5
-ALPHA_FREQ_BLEND = 0.6
 
 PSNR_MIN = 25.0
 SSIM_MIN = 0.80
 CNR_MIN  = 0.8
 
-ALPHA_MIN_SAFETY = 0.05
+ALPHA_MIN_SAFETY = 0.00
 DELTA_ALPHA = 0.05
 
-ALPHA_MIN = 0.2
+ALPHA_MIN = 0.7
 ALPHA_MAX = 0.9
 
 ROOT_SPLIT = "../../dataset/split_dataset"
-OUT_ROOT   = "../../dataset/hyfusion_v2"
+OUT_ROOT   = "../../dataset/hyfusion_v2" 
 
 NPY_ROOT   = os.path.join(OUT_ROOT, "NPY")
 PNG_ROOT   = os.path.join(OUT_ROOT, "PNG")
 MAN_ROOT   = os.path.join(OUT_ROOT, "manifest")
-LOG_PATH = os.path.join(MAN_ROOT, "log.txt")
-INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt") 
+LOG_PATH = os.path.join(MAN_ROOT, "log_rollback.txt")
+INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt")
 
-for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
-    os.makedirs(p, exist_ok=True)
+# Setup Directories
+COMPONENTS = ["hyfusion", "freq", "spatial"]
+for comp in COMPONENTS:
+    os.makedirs(os.path.join(NPY_ROOT, comp), exist_ok=True)
+    for split in ["train", "val", "test"]:
+        for cls in ["TB", "NonTB"]:
+            os.makedirs(os.path.join(PNG_ROOT, comp, split, cls), exist_ok=True)
 
-# Reset Main Log
+os.makedirs(MAN_ROOT, exist_ok=True)
+
+# Initialize Logs
 with open(LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Rollback Log\n")
 
 with open(INVERSION_LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Inversion Log (List of Inverted Files)\n")
 
-# UTIL — CORE
+# UTILITIES
 def extract_2d(img):
     img = np.asarray(img)
     if img.ndim == 2:
@@ -89,12 +94,10 @@ def needs_inversion(ds, img):
 
     return ie[~fg].mean() > ie[fg].mean()
 
-
 def pad_to_1024(img: np.ndarray):
     h, w = img.shape
     scale = min(TARGET_SIZE / h, TARGET_SIZE / w)
 
-    # DOWNSCALE ONLY IF NEEDED 
     if scale < 1.0:
         new_h = int(round(h * scale))
         new_w = int(round(w * scale))
@@ -103,15 +106,13 @@ def pad_to_1024(img: np.ndarray):
     else:
         new_h, new_w = h, w
 
-    # PADDING
     pt = (TARGET_SIZE - new_h) // 2
     pb = TARGET_SIZE - new_h - pt
     pl = (TARGET_SIZE - new_w) // 2
     pr = TARGET_SIZE - new_w - pl
 
-    # safety 
     assert pt >= 0 and pb >= 0 and pl >= 0 and pr >= 0, \
-        f"Invalid padding: {(pt, pb, pl, pr)} for shape {(new_h, new_w)}"
+        f"Invalid padding: {(pt, pb, pl, pr)}"
 
     canvas = np.pad(
         img,
@@ -124,8 +125,8 @@ def pad_to_1024(img: np.ndarray):
     valid_mask[pt:pt+new_h, pl:pl+new_w] = True
 
     pad_info = {
-        "orig_h": h,
-        "orig_w": w,
+        "orig_h": int(h), 
+        "orig_w": int(w),
         "scaled_h": new_h,
         "scaled_w": new_w,
         "scale": scale,
@@ -137,7 +138,7 @@ def pad_to_1024(img: np.ndarray):
 
     return canvas.astype(np.float32), valid_mask, pad_info
 
-# FREQUENCY & SPATIAL
+# FILTERS
 def homomorphic_filter(img):
     mn, mx = img.min(), img.max()
     norm = (img - mn) / (mx - mn + 1e-12)
@@ -170,31 +171,53 @@ def robust_spatial_norm(img, mask):
     out[~mask] = 0
     return out
 
-# QUALITY GUARD
+# QUALITY GUARD (FIXED)
 def compute_cnr(sig, ref, mask):
     s = sig[mask]; r = ref[mask]
     return (s.mean()-r.mean())/(r.std()+1e-9)
 
 def quality_guard(ie, ifreq, ispat, mask, alpha_s):
-    best = None
-    a = alpha_s
+    # 1. First Try
+    blend_init = ispat.copy()
+    blend_init[mask] = alpha_s * ifreq[mask] + (1 - alpha_s) * ispat[mask]
+    
+    psnr_i = peak_signal_noise_ratio(ie[mask], blend_init[mask], data_range=1)
+    ssim_i = structural_similarity(ie, blend_init, data_range=1)
+    cnr_i  = compute_cnr(blend_init, ie, mask)
+    
+    if psnr_i >= PSNR_MIN and ssim_i >= SSIM_MIN and cnr_i >= CNR_MIN:
+        return blend_init, alpha_s, psnr_i, ssim_i, cnr_i, False
+
+    # 2. Rollback Loop
+    best = (psnr_i + ssim_i*10 + cnr_i, blend_init, alpha_s, psnr_i, ssim_i, cnr_i)
+    
+    a = alpha_s - DELTA_ALPHA
     while a >= ALPHA_MIN_SAFETY:
         blend = ispat.copy()
-        blend[mask] = a*ifreq[mask] + (1-a)*ispat[mask]
+        blend[mask] = a * ifreq[mask] + (1 - a) * ispat[mask]
+        
         psnr = peak_signal_noise_ratio(ie[mask], blend[mask], data_range=1)
         ssim = structural_similarity(ie, blend, data_range=1)
         cnr  = compute_cnr(blend, ie, mask)
-        if psnr>=PSNR_MIN and ssim>=SSIM_MIN and cnr>=CNR_MIN:
-            return blend, a, psnr, ssim, cnr, "OK"
-        if best is None or psnr+ssim*10+cnr > best[0]:
-            best = (psnr+ssim*10+cnr, blend, a, psnr, ssim, cnr)
+        
+        if psnr >= PSNR_MIN and ssim >= SSIM_MIN and cnr >= CNR_MIN:
+            return blend, a, psnr, ssim, cnr, True 
+        
+        curr_score = psnr + ssim*10 + cnr
+        if curr_score > best[0]:
+            best = (curr_score, blend, a, psnr, ssim, cnr)
+        
         a -= DELTA_ALPHA
-    if best:
-        _, img, a, psnr, ssim, cnr = best
-        return img, a, psnr, ssim, cnr, "ROLLBACK"
-    return ispat, 0.0, np.nan, np.nan, np.nan, "FAIL"
+        
+    # 3. Fallback
+    _, img, a, psnr, ssim, cnr = best
+    
+    # Check if value actually changed
+    is_rollback = (abs(a - alpha_s) > 1e-6)
+    
+    return img, a, psnr, ssim, cnr, is_rollback
 
-# SITE DHI
+# DHI COMPUTATION 
 def _norm_text(s: str) -> str:
     return (s or "").upper().replace("_", " ").replace("-", " ")
 
@@ -209,15 +232,11 @@ SITE_CANON_MAP = {
 def canonicalize_site_id(raw: str) -> str:
     if not raw or not raw.strip():
         return "RS Paru dr. Ario Wirawan"
-
     s_norm = _norm_text(raw).strip()
-
     if s_norm in SITE_CANON_MAP:
         return SITE_CANON_MAP[s_norm]
-
     if "ARIO WIRAWAN" in s_norm and "PARU" in s_norm:
         return "RS Paru dr. Ario Wirawan"
-
     return raw.strip()
 
 def get_site_id(ds) -> str:
@@ -227,16 +246,9 @@ def get_site_id(ds) -> str:
             return canonicalize_site_id(str(val))
     return "RS Paru dr. Ario Wirawan"
 
-def compute_site_dhi(
-    dicom_paths,
-    alpha_min=ALPHA_MIN,
-    alpha_max=ALPHA_MAX,
-    eps=1e-6,
-    save_dir=MAN_ROOT
-):
+def compute_site_dhi(dicom_paths, alpha_min=ALPHA_MIN, alpha_max=ALPHA_MAX, eps=1e-6, save_dir=MAN_ROOT):
     records = []
 
-    # Collect per-image metadata & intensity
     for p in tqdm(dicom_paths, desc="Collecting DHI metadata"):
         try:
             ds = pydicom.dcmread(p)
@@ -244,39 +256,26 @@ def compute_site_dhi(
             continue
 
         site = get_site_id(ds)
-
-        # ---- Bit depth ----
         bits = getattr(ds, "BitsStored", None)
-        try:
-            bits = int(bits) if bits is not None else None
-        except Exception:
-            bits = None
+        try: bits = int(bits) if bits else None
+        except: bits = None
 
-        # ---- Pixel spacing ----
         d = None
         pxs = getattr(ds, "PixelSpacing", None)
-        if pxs is not None and len(pxs) >= 2:
-            try:
-                dx = float(pxs[0])
-                dy = float(pxs[1])
-                d = 0.5 * (dx + dy)
-            except Exception:
-                d = None
+        if pxs and len(pxs) >= 2:
+            try: d = 0.5 * (float(pxs[0]) + float(pxs[1]))
+            except: d = None
 
-        # ---- Image size ----
         rows = getattr(ds, "Rows", None)
         cols = getattr(ds, "Columns", None)
-        try:
-            A = int(rows) * int(cols)
-        except Exception:
-            A = None
+        try: A = int(rows) * int(cols)
+        except: A = None
 
         m_i = None
         try:
             raw = apply_voi_lut(ds.pixel_array, ds)
             img = extract_2d(raw).astype(np.float32)
-            if needs_inversion(ds, img):
-                img = img.max() - img
+            if needs_inversion(ds, img): img = img.max() - img
             mn, mx = img.min(), img.max()
             if mx - mn > 1e-12:
                 ie = (img - mn) / (mx - mn)
@@ -285,10 +284,11 @@ def compute_site_dhi(
                     m_i = float(np.mean(ie[mask]))
                 else:
                     m_i = float(np.mean(ie))
-        except Exception:
+        except:
             m_i = None
 
         records.append({
+            "dicom_path": p,
             "site": site,
             "BitsStored": bits,
             "spacing": d,
@@ -297,46 +297,40 @@ def compute_site_dhi(
         })
 
     df = pd.DataFrame(records)
+    
+    # Save Raw Audit
+    os.makedirs(save_dir, exist_ok=True)
+    df.to_csv(os.path.join(save_dir, "dhi_audit_raw_metadata.csv"), index=False)
+    print(f"Saved raw metadata audit to {os.path.join(save_dir, 'dhi_audit_raw_metadata.csv')}")
 
-    # Compute DHI components per site
     site_rows = []
-
     for site, g in df.groupby("site"):
         N = len(g)
-
-        # ---- H_bitdepth (dominance-based) ----
         bs = g["BitsStored"].dropna()
         if len(bs) > 0:
             dom = bs.value_counts().max()
             H_bit = 1.0 - (dom / len(bs))
-        else:
-            H_bit = 0.0
+        else: H_bit = 0.0
 
-        # ---- H_spacing (CV) ----
         dvals = g["spacing"].dropna()
         if len(dvals) > 1 and dvals.mean() > 0:
             H_spacing = min(dvals.std() / (dvals.mean() + eps), 1.0)
-        else:
-            H_spacing = 0.0
+        else: H_spacing = 0.0
 
-        # ---- H_size (CV of area) ----
         Avals = g["area"].dropna()
         if len(Avals) > 1 and Avals.mean() > 0:
             H_size = min(Avals.std() / (Avals.mean() + eps), 1.0)
-        else:
-            H_size = 0.0
+        else: H_size = 0.0
 
-        # ---- H_intensity (CV of Ie mean) ----
         ivals = g["intensity_mean"].dropna()
         if len(ivals) > 1 and ivals.mean() > 0:
             H_int = min(ivals.std() / (ivals.mean() + eps), 1.0)
-        else:
-            H_int = 0.0
+        else: H_int = 0.0
 
-        # ---- Final DHI ----
         DHI = (H_bit + H_spacing + H_size + H_int) / 4.0
-
         alpha_s = alpha_min + (alpha_max - alpha_min) * DHI
+        freq_pct = alpha_s * 100
+        spat_pct = (1.0 - alpha_s) * 100
 
         site_rows.append({
             "site": site,
@@ -347,44 +341,19 @@ def compute_site_dhi(
             "H_intensity": H_int,
             "DHI": DHI,
             "alpha_s": alpha_s,
+            "freq_pct": f"{freq_pct:.2f}%",
+            "spat_pct": f"{spat_pct:.2f}%",
         })
 
     df_site = pd.DataFrame(site_rows)
-
-    # Save CSVs
-    os.makedirs(save_dir, exist_ok=True)
-
-    df_site.to_csv(
-        os.path.join(save_dir, "site_dhi_components.csv"),
-        index=False
-    )
-
+    df_site.to_csv(os.path.join(save_dir, "site_dhi_components.csv"), index=False)
     SITE_ALPHA = dict(zip(df_site["site"], df_site["alpha_s"]))
-
     return SITE_ALPHA, df_site
-
-# SETUP DIREKTORI BERDASARKAN KOMPONEN
-COMPONENTS = ["hyfusion", "freq", "spatial"]
-
-# Membuat struktur folder untuk NPY dan PNG
-for comp in COMPONENTS:
-    # Buat folder NPY/hyfusion, NPY/freq, NPY/spatial
-    os.makedirs(os.path.join(NPY_ROOT, comp), exist_ok=True)
-    
-    # Buat folder PNG/hyfusion/train/TB, dll
-    for split in ["train", "val", "test"]:
-        for cls in ["TB", "NonTB"]:
-            os.makedirs(os.path.join(PNG_ROOT, comp, split, cls), exist_ok=True)
-
-# File Log
-with open(LOG_PATH, "w") as f:
-    f.write("# HyFusion-v2 Component-based Log\n")
 
 # MAIN PIPELINE
 manifest = []
 all_paths = []
 
-# 1. PRE-CALCULATE DHI (Site Variance)
 print("Computing DHI Site Variance...")
 for split in ["train", "val", "test"]:
     for cls in ["TB", "NonTB"]:
@@ -393,7 +362,6 @@ for split in ["train", "val", "test"]:
             all_paths += [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".dcm")]
 
 SITE_ALPHA, df_site = compute_site_dhi(all_paths)
-# df_site.to_csv(os.path.join(MAN_ROOT, "site_variance.csv"), index=False)
 
 print("Starting processing...")
 
@@ -407,67 +375,71 @@ for split in ["train", "val", "test"]:
 
     for cls, yv in [("TB", 1), ("NonTB", 0)]:
         src = os.path.join(ROOT_SPLIT, split, cls)
-        
-        if not os.path.exists(src):
-            continue
+        if not os.path.exists(src): continue
 
         for f in tqdm(os.listdir(src), desc=f"{split}-{cls}"):
             if not f.endswith(".dcm"): continue
             
             p = os.path.join(src, f)
             try:
-                # --- READ & PREPROCESS ---
+                # 1. Read
                 ds = pydicom.dcmread(p)
                 raw = apply_voi_lut(ds.pixel_array, ds)
                 img = extract_2d(raw)
                 
+                # 2. Inversion Check
                 is_inverted = needs_inversion(ds, img)
                 if is_inverted: 
                     img = img.max() - img
-                    # Log file inversion
                     with open(INVERSION_LOG_PATH, "a") as f_inv:
                         f_inv.write(f"{p}\n")
                 
+                # 3. Preprocess
                 ie = (img - img.min()) / (img.max() - img.min() + 1e-12)
                 mask = ie > BG_THRESHOLD
 
-                # 1. Frequency
+                # 4. Filter Components
                 ifreq = adaptive_gamma(homomorphic_filter(ie))
-                # 2. Spatial
                 ispat = robust_spatial_norm(ifreq, mask)
-                # 3. HyFusion
-                alpha = SITE_ALPHA.get(get_site_id(ds), ALPHA_MIN)
-                ihyf, a_f, psnr, ssim, cnr, status = quality_guard(ie, ifreq, ispat, mask, alpha)
                 
-                # --- LOGGING ROLLBACK ---
-                if status != "OK":
+                # 5. HyFusion & Quality Guard
+                alpha_site = SITE_ALPHA.get(get_site_id(ds), ALPHA_MIN)
+                ihyf, a_f, psnr, ssim, cnr, is_rollback = quality_guard(ie, ifreq, ispat, mask, alpha_site)
+                
+                # Log Rollback
+                if is_rollback:
                     with open(LOG_PATH, "a") as f_log:
-                        f_log.write(f"{p} | {split} | {cls} | site={get_site_id(ds)} | status={status}\n")
+                        f_log.write(f"{p} | {split} | {cls} | site={get_site_id(ds)} | ROLLBACK_OCCURRED | orig={alpha_site:.2f} | final={a_f:.2f}\n")
 
-                # --- PADDING TO 1024 ---
+                # 6. Pad All Components to 1024
                 ihyf_1024, _, pad_info = pad_to_1024(ihyf)
                 ifreq_1024, _, _ = pad_to_1024(ifreq)
                 ispat_1024, _, _ = pad_to_1024(ispat)
 
-                # --- SAVE PNG  ---
+                # 7. Metadata
+                freq_pct = a_f * 100
+                spat_pct = (1.0 - a_f) * 100
+                px_min = float(ihyf_1024.min())
+                px_max = float(ihyf_1024.max())
+
+                # 8. Save PNGs (Separated Folders)
                 base_name = os.path.splitext(os.path.basename(p))[0] + ".png"
                 
                 path_hyf  = os.path.join(PNG_ROOT, "hyfusion", split, cls, base_name)
                 path_freq = os.path.join(PNG_ROOT, "freq", split, cls, base_name)
                 path_spat = os.path.join(PNG_ROOT, "spatial", split, cls, base_name)
 
-                # Save Images
                 cv2.imwrite(path_hyf,  np.clip(ihyf_1024 * 255.0, 0, 255).astype(np.uint8))
                 cv2.imwrite(path_freq, np.clip(ifreq_1024 * 255.0, 0, 255).astype(np.uint8))
                 cv2.imwrite(path_spat, np.clip(ispat_1024 * 255.0, 0, 255).astype(np.uint8))
 
-                # --- APPEND TO LISTS (NPY) ---
+                # 9. Append to Arrays
                 X_hyf.append(ihyf_1024[..., None])
                 X_freq.append(ifreq_1024[..., None])
                 X_spat.append(ispat_1024[..., None])
                 y.append(yv)
 
-                # --- UPDATE MANIFEST ---
+                # 10. Manifest
                 manifest.append({
                     "split": split,
                     "label": cls,
@@ -476,9 +448,19 @@ for split in ["train", "val", "test"]:
                     "path_freq": path_freq,
                     "path_spatial": path_spat,
                     "site": get_site_id(ds),
-                    "status": status,
+                    "rollback": is_rollback,
+                    "alpha_s": alpha_site,
                     "alpha_final": a_f,
-                    "inverted": is_inverted 
+                    "freq_pct": f"{freq_pct:.2f}%",
+                    "spat_pct": f"{spat_pct:.2f}%",
+                    "orig_h": pad_info["orig_h"],
+                    "orig_w": pad_info["orig_w"],
+                    "pixel_min": px_min,
+                    "pixel_max": px_max,
+                    "inverted": is_inverted,
+                    "psnr": psnr,
+                    "ssim": ssim,
+                    "cnr": cnr
                 })
 
             except Exception as e:
@@ -487,25 +469,42 @@ for split in ["train", "val", "test"]:
 
     if len(y) > 0:
         print(f"Saving NPYs for {split}...")
-        
         y_arr = np.array(y, np.int64)
-
-        # 1. Save HYFUSION
+        
+        # Save HyFusion
         np.save(os.path.join(NPY_ROOT, "hyfusion", f"X_{split}.npy"), np.array(X_hyf, np.float32))
         np.save(os.path.join(NPY_ROOT, "hyfusion", f"y_{split}.npy"), y_arr) 
         
-        # 2. Save FREQUENCY
+        # Save Frequency
         np.save(os.path.join(NPY_ROOT, "freq", f"X_{split}.npy"), np.array(X_freq, np.float32))
         np.save(os.path.join(NPY_ROOT, "freq", f"y_{split}.npy"), y_arr)     
         
-        # 3. Save SPATIAL
+        # Save Spatial
         np.save(os.path.join(NPY_ROOT, "spatial", f"X_{split}.npy"), np.array(X_spat, np.float32))
         np.save(os.path.join(NPY_ROOT, "spatial", f"y_{split}.npy"), y_arr)  
         
-        print(f"Saved {len(y)} samples to hyfusion/, freq/, and spatial/ folders.")
+        print(f"Saved {len(y)} samples to component folders.")
     else:
         print(f"Warning: No data for split {split}")
 
-# SAVE MANIFEST
+# Save Final Manifest
 pd.DataFrame(manifest).to_csv(os.path.join(MAN_ROOT, "hyfusion_manifest_separated.csv"), index=False)
-print("[DONE] Pipeline completed. Folders organized by component.")
+
+# Summary to Log
+df_m = pd.DataFrame(manifest)
+if not df_m.empty:
+    n_total = len(df_m)
+    n_ok = (df_m["rollback"] == False).sum()
+    n_rb = (df_m["rollback"] == True).sum()
+    n_rb0 = (df_m["alpha_final"] <= 0.0).sum()
+    n_inverted = df_m["inverted"].sum()
+
+    with open(LOG_PATH, "a") as f:
+        f.write("\n# SUMMARY\n")
+        f.write(f"Total files       : {n_total}\n")
+        f.write(f"OK (No Rollback)  : {n_ok}\n")
+        f.write(f"Rollback Occurred : {n_rb}\n")
+        f.write(f"Rollback to zero  : {n_rb0}\n")
+        f.write(f"Inverted Files    : {n_inverted}\n")
+
+print("[DONE] HyFusion-v2 Separated Pipeline completed.")

@@ -21,7 +21,6 @@ MIN_CONTENT_FRAC = 0.15
 SIGMA_HOMO = 30.0
 HIGH_GAIN = 1.5
 LOW_GAIN = 0.5
-ALPHA_FREQ_BLEND = 0.6
 
 PSNR_MIN = 25.0
 SSIM_MIN = 0.80
@@ -30,7 +29,7 @@ CNR_MIN  = 0.8
 ALPHA_MIN_SAFETY = 0.05
 DELTA_ALPHA = 0.05
 
-ALPHA_MIN = 0.2
+ALPHA_MIN = 0.7
 ALPHA_MAX = 0.9
 
 ROOT_SPLIT = "../../dataset/split_dataset"
@@ -40,7 +39,7 @@ NPY_ROOT   = os.path.join(OUT_ROOT, "NPY")
 PNG_ROOT   = os.path.join(OUT_ROOT, "PNG")
 MAN_ROOT   = os.path.join(OUT_ROOT, "manifest")
 LOG_PATH = os.path.join(MAN_ROOT, "log.txt")
-INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt") # [NEW] Path log inversion
+INVERSION_LOG_PATH = os.path.join(MAN_ROOT, "log_inversion.txt")
 
 for p in [NPY_ROOT, PNG_ROOT, MAN_ROOT]:
     os.makedirs(p, exist_ok=True)
@@ -51,6 +50,7 @@ with open(LOG_PATH, "w") as f:
 with open(INVERSION_LOG_PATH, "w") as f:
     f.write("# HyFusion-v2 Inversion Log (List of Inverted Files)\n")
 
+# --- UTILS ---
 def extract_2d(img):
     img = np.asarray(img)
     if img.ndim == 2:
@@ -121,8 +121,8 @@ def pad_to_1024(img: np.ndarray):
     valid_mask[pt:pt+new_h, pl:pl+new_w] = True
 
     pad_info = {
-        "orig_h": h,
-        "orig_w": w,
+        "orig_h": int(h), 
+        "orig_w": int(w),
         "scaled_h": new_h,
         "scaled_w": new_w,
         "scale": scale,
@@ -134,7 +134,7 @@ def pad_to_1024(img: np.ndarray):
 
     return canvas.astype(np.float32), valid_mask, pad_info
 
-# FREQUENCY & SPATIAL
+# --- FREQUENCY & SPATIAL ---
 def homomorphic_filter(img):
     mn, mx = img.min(), img.max()
     norm = (img - mn) / (mx - mn + 1e-12)
@@ -167,31 +167,57 @@ def robust_spatial_norm(img, mask):
     out[~mask] = 0
     return out
 
-# QUALITY GUARD
+# --- QUALITY GUARD  ---
 def compute_cnr(sig, ref, mask):
     s = sig[mask]; r = ref[mask]
     return (s.mean()-r.mean())/(r.std()+1e-9)
 
 def quality_guard(ie, ifreq, ispat, mask, alpha_s):
-    best = None
-    a = alpha_s
+    # 1. COBA ALPHA AWAL
+    blend_init = ispat.copy()
+    blend_init[mask] = alpha_s * ifreq[mask] + (1 - alpha_s) * ispat[mask]
+    
+    psnr_i = peak_signal_noise_ratio(ie[mask], blend_init[mask], data_range=1)
+    ssim_i = structural_similarity(ie, blend_init, data_range=1)
+    cnr_i  = compute_cnr(blend_init, ie, mask)
+    
+    # Jika awal sudah bagus, return False (Tidak Rollback)
+    if psnr_i >= PSNR_MIN and ssim_i >= SSIM_MIN and cnr_i >= CNR_MIN:
+        return blend_init, alpha_s, psnr_i, ssim_i, cnr_i, False
+
+    # 2. JIKA GAGAL, MASUK MODE ROLLBACK
+    # Inisialisasi best dengan nilai awal
+    best = (psnr_i + ssim_i*10 + cnr_i, blend_init, alpha_s, psnr_i, ssim_i, cnr_i)
+    
+    a = alpha_s - DELTA_ALPHA
     while a >= ALPHA_MIN_SAFETY:
         blend = ispat.copy()
-        blend[mask] = a*ifreq[mask] + (1-a)*ispat[mask]
+        blend[mask] = a * ifreq[mask] + (1 - a) * ispat[mask]
+        
         psnr = peak_signal_noise_ratio(ie[mask], blend[mask], data_range=1)
         ssim = structural_similarity(ie, blend, data_range=1)
         cnr  = compute_cnr(blend, ie, mask)
-        if psnr>=PSNR_MIN and ssim>=SSIM_MIN and cnr>=CNR_MIN:
-            return blend, a, psnr, ssim, cnr, "OK"
-        if best is None or psnr+ssim*10+cnr > best[0]:
-            best = (psnr+ssim*10+cnr, blend, a, psnr, ssim, cnr)
+        
+        # Jika ketemu yang bagus saat loop
+        if psnr >= PSNR_MIN and ssim >= SSIM_MIN and cnr >= CNR_MIN:
+            # Karena loop berjalan mundur, 'a' pasti != alpha_s, maka True
+            return blend, a, psnr, ssim, cnr, True 
+        
+        # Simpan score tertinggi sebagai cadangan
+        curr_score = psnr + ssim*10 + cnr
+        if curr_score > best[0]:
+            best = (curr_score, blend, a, psnr, ssim, cnr)
+        
         a -= DELTA_ALPHA
-    if best:
-        _, img, a, psnr, ssim, cnr = best
-        return img, a, psnr, ssim, cnr, "ROLLBACK"
-    return ispat, 0.0, np.nan, np.nan, np.nan, "FAIL"
+        
+    # 3. FALLBACK (Jika tidak ada yang pass threshold)
+    _, img, a, psnr, ssim, cnr = best
+    
+    is_rollback = (abs(a - alpha_s) > 1e-6)
+    
+    return img, a, psnr, ssim, cnr, is_rollback
 
-# SITE DHI
+# --- SITE DHI ---
 def _norm_text(s: str) -> str:
     return (s or "").upper().replace("_", " ").replace("-", " ")
 
@@ -286,6 +312,7 @@ def compute_site_dhi(
             m_i = None
 
         records.append({
+            "dicom_path": p,       
             "site": site,
             "BitsStored": bits,
             "spacing": d,
@@ -294,6 +321,10 @@ def compute_site_dhi(
         })
 
     df = pd.DataFrame(records)
+    
+    os.makedirs(save_dir, exist_ok=True)
+    df.to_csv(os.path.join(save_dir, "dhi_audit_raw_metadata.csv"), index=False)
+    print(f"Saved raw metadata audit to {os.path.join(save_dir, 'dhi_audit_raw_metadata.csv')}")
 
     # Compute DHI components per site
     site_rows = []
@@ -335,6 +366,9 @@ def compute_site_dhi(
 
         alpha_s = alpha_min + (alpha_max - alpha_min) * DHI
 
+        freq_pct = alpha_s * 100
+        spat_pct = (1.0 - alpha_s) * 100
+
         site_rows.append({
             "site": site,
             "N_images": N,
@@ -344,13 +378,13 @@ def compute_site_dhi(
             "H_intensity": H_int,
             "DHI": DHI,
             "alpha_s": alpha_s,
+            "freq_pct": f"{freq_pct:.2f}%",
+            "spat_pct": f"{spat_pct:.2f}%",
         })
 
     df_site = pd.DataFrame(site_rows)
 
     # Save CSVs
-    os.makedirs(save_dir, exist_ok=True)
-
     df_site.to_csv(
         os.path.join(save_dir, "site_dhi_components.csv"),
         index=False
@@ -361,7 +395,7 @@ def compute_site_dhi(
     return SITE_ALPHA, df_site
 
 
-# MAIN PIPELINE
+# --- MAIN PIPELINE ---
 manifest=[]
 all_paths=[]
 
@@ -372,7 +406,6 @@ for split in ["train","val","test"]:
             all_paths += [os.path.join(d,f) for f in os.listdir(d) if f.endswith(".dcm")]
 
 SITE_ALPHA, df_site = compute_site_dhi(all_paths)
-# df_site.to_csv(os.path.join(MAN_ROOT,"site_variance.csv"),index=False)
 
 for split in ["train","val","test"]:
     X=[]; y=[]
@@ -388,11 +421,9 @@ for split in ["train","val","test"]:
                 raw=apply_voi_lut(ds.pixel_array,ds)
                 img=extract_2d(raw)
                 
-                # [MODIFIED] INVERSION LOGIC
                 is_inverted = needs_inversion(ds, img)
                 if is_inverted:
                     img = img.max() - img
-                    # [NEW] Log to inversion text file
                     with open(INVERSION_LOG_PATH, "a") as f_inv:
                         f_inv.write(f"{p}\n")
 
@@ -403,32 +434,35 @@ for split in ["train","val","test"]:
                 ispat=robust_spatial_norm(ifreq,mask)
 
                 alpha=SITE_ALPHA.get(get_site_id(ds),ALPHA_MIN)
-                ihyf,a_f,psnr,ssim,cnr,status=quality_guard(ie,ifreq,ispat,mask,alpha)
                 
-                # ---------- LOG ROLLBACK ----------
-                if status != "OK":
+                # Call quality_guard with 
+                ihyf, a_f, psnr, ssim, cnr, is_rollback = quality_guard(ie, ifreq, ispat, mask, alpha)
+                
+                # ---------- LOG ROLLBACK  ----------
+                if is_rollback:
                     with open(LOG_PATH, "a") as f:
                         f.write(
                             f"{p} | "
                             f"split={split} | label={cls} | site={get_site_id(ds)} | "
                             f"alpha_s={alpha:.3f} | alpha_final={a_f:.3f} | "
                             f"psnr={psnr:.3f} | ssim={ssim:.3f} | cnr={cnr:.3f} | "
-                            f"status={status}\n"
-                        )
-
-                # log explicit rollback-to-zero
-                if status != "OK" and a_f <= 0.0:
-                    with open(LOG_PATH, "a") as f:
-                        f.write(
-                            f"[ROLLBACK_TO_ZERO] {p} | "
-                            f"split={split} | label={cls} | site={get_site_id(ds)}\n"
+                            f"ROLLBACK_OCCURRED\n"
                         )
 
                 ihyf_1024, valid_mask_1024, pad_info = pad_to_1024(ihyf)
+                
+                # Metadata
+                freq_pct = a_f * 100
+                spat_pct = (1.0 - a_f) * 100
+                px_min = float(ihyf_1024.min())
+                px_max = float(ihyf_1024.max())
 
                 # ---------- SAVE PNG ----------
                 png_name = os.path.splitext(os.path.basename(p))[0] + ".png"
                 png_path = os.path.join(PNG_ROOT, split, cls, png_name)
+                
+                # Create subdir if needed
+                os.makedirs(os.path.dirname(png_path), exist_ok=True)
 
                 png_u8 = np.clip(ihyf_1024 * 255.0, 0, 255).astype(np.uint8)
                 cv2.imwrite(png_path, png_u8)
@@ -448,7 +482,14 @@ for split in ["train","val","test"]:
                     "psnr": psnr,
                     "ssim": ssim,
                     "cnr": cnr,
-                    "status": status,
+                    "rollback": is_rollback, 
+
+                    "freq_pct": f"{freq_pct:.2f}%",   
+                    "spat_pct": f"{spat_pct:.2f}%",   
+                    "orig_h": pad_info["orig_h"],     
+                    "orig_w": pad_info["orig_w"],     
+                    "pixel_min": px_min,              
+                    "pixel_max": px_max,              
                     "inverted": is_inverted, 
 
                     "pad_top": pad_info["pad_top"],
@@ -472,21 +513,22 @@ for split in ["train","val","test"]:
 # SAVE MANIFEST
 pd.DataFrame(manifest).to_csv(os.path.join(MAN_ROOT,"hyfusion_manifest.csv"),index=False)
 
-# ---------- SUMMARY ----------
+# ---------- SUMMARY  ----------
 df_m = pd.DataFrame(manifest)
 
 if not df_m.empty:
     n_total = len(df_m)
-    n_ok = (df_m["status"] == "OK").sum()
-    n_rb = (df_m["status"] != "OK").sum()
+    # is_rollback == False means OK
+    n_ok = (df_m["rollback"] == False).sum()
+    n_rb = (df_m["rollback"] == True).sum()
     n_rb0 = (df_m["alpha_final"] <= 0.0).sum()
     n_inverted = df_m["inverted"].sum() 
 
     with open(LOG_PATH, "a") as f:
         f.write("\n# SUMMARY\n")
         f.write(f"Total files       : {n_total}\n")
-        f.write(f"OK                : {n_ok}\n")
-        f.write(f"Rollback          : {n_rb}\n")
+        f.write(f"OK (No Rollback)  : {n_ok}\n")
+        f.write(f"Rollback Occurred : {n_rb}\n")
         f.write(f"Rollback to zero  : {n_rb0}\n")
         f.write(f"Inverted Files    : {n_inverted}\n")
 
