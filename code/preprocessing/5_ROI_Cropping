@@ -1,0 +1,251 @@
+import os
+import glob
+import shutil
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+import segmentation_models_pytorch as smp
+from pathlib import Path
+from tqdm import tqdm
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# --- KONFIGURASI ---
+class Config:
+    SEG_MODEL_PATH = "../segmentation/experiments/augmentation_run/mit_FPN_AUG_PHYSICAL_20251227"
+    BASE_DIR = Path("abusalam_dsn/darnell/dokumentasi/dicom/dataset")
+    
+    PATHS = {
+        "Baseline_NPY": BASE_DIR / "/baseline/NPY",
+        "Baseline_PNG": BASE_DIR / "/baseline/PNG",
+        "Hyfusion_NPY": BASE_DIR / "/hyfusion_v2/NPY/hyfusion"
+    }
+    
+    OUTPUT_ROOT = Path("../../dataset/ROI_FINAL_GENERATED")
+    
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    IMG_SIZE_MODEL = (512, 512) 
+    OUTPUT_SIZE_NPY = (1024, 1024) 
+    THRESHOLD = 0.5
+    PADDING = 0.0 # Ketat pas paru
+
+# --- MODEL & UTILS ---
+class GrayToRGB(torch.nn.Module):
+    def forward(self, x): return x.repeat(1, 3, 1, 1)
+
+def load_segmenter(path):
+    print(f"Loading Segmenter: {path}")
+    model = smp.FPN(encoder_name="mit_b5", encoder_weights=None, in_channels=3, classes=1)
+    full_model = torch.nn.Sequential(GrayToRGB(), model)
+    state = torch.load(path, map_location=Config.DEVICE)
+    full_model.load_state_dict(state)
+    full_model.to(Config.DEVICE)
+    full_model.eval()
+    return full_model
+
+def get_bbox_and_mask(img_orig, model):
+    h_orig, w_orig = img_orig.shape
+    
+    # Downsample untuk prediksi
+    img_small = cv2.resize(img_orig, Config.IMG_SIZE_MODEL)
+    img_t = torch.from_numpy(img_small).float()/255.0
+    img_t = img_t.unsqueeze(0).unsqueeze(0).to(Config.DEVICE)
+    
+    with torch.no_grad():
+        logits = model(img_t)
+        pred_small = (torch.sigmoid(logits) > Config.THRESHOLD).cpu().numpy()[0, 0]
+        
+    # Upsample Mask
+    mask_orig = cv2.resize(pred_small.astype(np.uint8), (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+    
+    # Hitung BBox
+    rows = np.any(mask_orig, axis=1)
+    cols = np.any(mask_orig, axis=0)
+    
+    if not np.any(rows) or not np.any(cols):
+        return None, None
+        
+    y_min, y_max = np.where(rows)[0][[0, -1]]
+    x_min, x_max = np.where(cols)[0][[0, -1]]
+    
+    # Padding Logic (Optional)
+    h_box = y_max - y_min
+    w_box = x_max - x_min
+    pad_y = int(h_box * Config.PADDING)
+    pad_x = int(w_box * Config.PADDING)
+    
+    y_min = max(0, y_min - pad_y)
+    y_max = min(h_orig, y_max + pad_y)
+    x_min = max(0, x_min - pad_x)
+    x_max = min(w_orig, x_max + pad_x)
+    
+    return mask_orig, (x_min, y_min, x_max, y_max)
+
+def apply_smart_crop(img, mask, bbox):
+    """Masking -> Cropping"""
+    # 1. Masking (Hitamkan Background)
+    mask_uint8 = (mask * 255).astype(np.uint8)
+    img_masked = cv2.bitwise_and(img, img, mask=mask_uint8)
+    
+    # 2. Cropping
+    x1, y1, x2, y2 = bbox
+    crop = img_masked[y1:y2, x1:x2]
+    return crop
+
+def process_png_structure(input_root, output_root, model):
+    print(f"\n--- Processing PNG Folder: {input_root.name} ---")
+
+    all_files = list(input_root.rglob("*.png"))
+    
+    metadata = []
+    
+    for path in tqdm(all_files, desc="PNG Processing"):
+        # Relatif path untuk mirror struktur folder (misal: test/TB/img1.png)
+        rel_path = path.relative_to(input_root)
+        save_path = output_root / rel_path
+        
+        # Buat folder tujuan jika belum ada
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Proses
+        img_orig = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img_orig is None: continue
+        
+        h, w = img_orig.shape
+        mask, bbox = get_bbox_and_mask(img_orig, model)
+        
+        if bbox is None:
+            final_img = img_orig 
+            coords = (0, 0, w, h)
+        else:
+            final_img = apply_smart_crop(img_orig, mask, bbox)
+            coords = bbox
+            
+        cv2.imwrite(str(save_path), final_img)
+        
+        metadata.append({
+            "original_path": str(rel_path),
+            "crop_coords": coords
+        })
+        
+    pd.DataFrame(metadata).to_csv(output_root / "crop_coords.csv", index=False)
+
+# --- UPDATE UNTUK PROCESSOR 2: FILE NPY + METADATA ---
+def process_npy_structure(input_root, output_root, model):
+    print(f"\n--- Processing NPY Folder: {input_root.name} ---")
+    output_root.mkdir(parents=True, exist_ok=True)
+    
+    # Cari file X_*.npy (Data Gambar)
+    x_files = sorted(list(input_root.glob("X_*.npy"))) 
+    
+    for x_path in x_files:
+        print(f"Processing Array: {x_path.name}")
+        
+        # Load NPY
+        data = np.load(x_path) 
+        
+        # Handle Channel dimension
+        has_channel = False
+        if data.ndim == 4: 
+            data = data.squeeze(-1)
+            has_channel = True
+            
+        new_data = []
+        metadata_list = [] # LIST UNTUK MENYIMPAN KOORDINAT
+        
+        for i in tqdm(range(len(data)), desc=x_path.name):
+            img = data[i]
+            
+            # Normalisasi ke uint8
+            is_float = False
+            if img.max() <= 1.5:
+                img = (img * 255).astype(np.uint8)
+                is_float = True
+            else:
+                img = img.astype(np.uint8)
+                
+            # Proses Smart Crop
+            mask, bbox = get_bbox_and_mask(img, model)
+            
+            # Default coords jika gagal crop (Full Image)
+            h, w = img.shape
+            coords = (0, 0, w, h) 
+            
+            if bbox is None:
+                crop = img
+            else:
+                crop = apply_smart_crop(img, mask, bbox)
+                coords = bbox # (x1, y1, x2, y2)
+            
+            metadata_list.append({
+                "index": i,                 # Urutan di array
+                "orig_w": w,                # Lebar asli sebelum crop
+                "orig_h": h,                # Tinggi asli sebelum crop
+                "crop_x1": coords[0],
+                "crop_y1": coords[1],
+                "crop_x2": coords[2],
+                "crop_y2": coords[3],
+                "crop_w_real": coords[2] - coords[0], # Lebar asli potongan
+                "crop_h_real": coords[3] - coords[1]  # Tinggi asli potongan
+            })
+
+            # RESIZE WAJIB UNTUK NPY (Packing)
+            crop_resized = cv2.resize(crop, Config.OUTPUT_SIZE_NPY, interpolation=cv2.INTER_LINEAR)
+            
+            # Kembalikan ke format float jika perlu
+            if is_float:
+                crop_resized = crop_resized.astype(np.float32) / 255.0
+                
+            new_data.append(crop_resized)
+            
+        # Save NPY Baru
+        new_data_arr = np.array(new_data)
+        if has_channel:
+            new_data_arr = np.expand_dims(new_data_arr, axis=-1)
+        np.save(output_root / x_path.name, new_data_arr)
+        
+        # --- SAVE METADATA CSV ---
+        meta_name = x_path.stem + "_coords.csv"
+        pd.DataFrame(metadata_list).to_csv(output_root / meta_name, index=False)
+        print(f"   Saved metadata: {meta_name}")
+        
+    # Copy file Label (Y_*.npy)
+    y_files = list(input_root.glob("Y_*.npy")) 
+    y_files += list(input_root.glob("y_*.npy"))
+    
+    print("Copying Label files...")
+    for y_path in y_files:
+        shutil.copy(y_path, output_root / y_path.name)
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    if not os.path.exists(Config.SEG_MODEL_PATH):
+        print(f"Error: Model tidak ditemukan di {Config.SEG_MODEL_PATH}")
+        exit()
+        
+    model = load_segmenter(Config.SEG_MODEL_PATH)
+    
+    # 1. Process Baseline NPY
+    process_npy_structure(
+        Config.PATHS["Baseline_NPY"], 
+        Config.OUTPUT_ROOT / "Baseline_NPY_ROI", 
+        model
+    )
+    
+    # 2. Process Baseline PNG
+    process_png_structure(
+        Config.PATHS["Baseline_PNG"], 
+        Config.OUTPUT_ROOT / "Baseline_PNG_ROI", 
+        model
+    )
+    
+    # 3. Process Hyfusion NPY
+    process_npy_structure(
+        Config.PATHS["Hyfusion_NPY"], 
+        Config.OUTPUT_ROOT / "Hyfusion_NPY_ROI", 
+        model
+    )
+    
+    print("\nAll Processing Completed!")
+    print(f"Results saved in: {Config.OUTPUT_ROOT}")
