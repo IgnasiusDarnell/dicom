@@ -1,0 +1,24 @@
+#1.Baseline PNG
+nohup python 1_classification.py --exp_name "1_Baseline_Full_PNG" \
+ --data_path "../../dataset/baseline/PNG" --mode png \
+ > 1_baseline_png.log 2>&1 &
+
+#2.Baseline NPY
+nohup python 1_classification.py --exp_name "1_Baseline_Full_NPY" \
+ --data_path "../../dataset/baseline/NPY" --mode npy \
+ > 2_baseline_npy.log 2>&1 &
+
+#3.Hyfusion NPY
+nohup python 1_classification.py --exp_name "2_HyFusion_Full" \
+ --data_path "../../dataset/hyfusion_v2/NPY/hyfusion" --mode npy \
+ > 3_hyfusion_full.log 2>&1 &
+
+#5.Baseline ROI NPY
+nohup python 1_classification.py --exp_name "3_Baseline_ROI" \
+ --data_path "../../dataset/ROI_FINAL_GENERATED/Baseline_NPY_ROI" --mode npy \
+ > 4_baseline_roi.log 2>&1 &
+
+#5.Hyfusion ROI NPY
+nohup python 1_classification.py --exp_name "4_HyFusion_ROI" \
+ --data_path "../../dataset/ROI_FINAL_GENERATED/Hyfusion_NPY_ROI" --mode npy \
+ > 5_hyfusion_roi.log 2>&1 &
