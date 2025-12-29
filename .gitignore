@@ -19,3 +19,14 @@ output/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# model & weight files
+*.onnx
+*.pt
+*.pth
+*.ckpt
+
+# experiment outputs
+code/segmentation/experiments/
+
+
