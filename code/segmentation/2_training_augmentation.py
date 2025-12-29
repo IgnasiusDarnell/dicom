@@ -141,51 +141,76 @@ def generate_augmented_data(files, root_dir, split_name, repeat=0, pipeline=None
 # --- 4. DATASET ---
 class SimpleDataset(Dataset):
     def __init__(self, img_dir, msk_dir, size=(512, 512), clip_limit=3.0):
-        # Load file dari folder generated
-        self.img_paths = sorted(glob.glob(str(img_dir / "*.png")))
-        self.msk_paths = sorted(glob.glob(str(msk_dir / "*.png")))
         self.size = size
         self.clahe = A.CLAHE(clip_limit=clip_limit, tile_grid_size=(8, 8), p=1.0)
 
+        img_paths = sorted(glob.glob(str(Path(img_dir) / "*.png")))
+        msk_paths = sorted(glob.glob(str(Path(msk_dir) / "*.png")))
+
+        # build paired list
+        self.files = []
+        for img_path in img_paths:
+            stem = Path(img_path).stem
+            mask_path = Path(msk_dir) / f"{stem}.png"
+            if mask_path.exists():
+                self.files.append({
+                    "image": img_path,
+                    "mask": str(mask_path)
+                })
+
+        if len(self.files) == 0:
+            raise RuntimeError(f"No paired image-mask found in {img_dir}")
+
     def _resize_pad(self, img, is_mask=False):
-        # Logika resize sama persis dengan Code 1
         th, tw = self.size
         h, w = img.shape[:2]
+
         scale = min(th / max(1, h), tw / max(1, w))
         nh, nw = int(round(h * scale)), int(round(w * scale))
+
         interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
-        
         resized = cv2.resize(img, (nw, nh), interpolation=interp)
-        
+
         ph, pw = th - nh, tw - nw
         top, bottom = ph // 2, ph - ph // 2
         left, right = pw // 2, pw - pw // 2
-        
-        return cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+
+        return cv2.copyMakeBorder(
+            resized, top, bottom, left, right,
+            cv2.BORDER_CONSTANT, value=0
+        )
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         item = self.files[idx]
-        
+
         img = cv2.imread(item["image"], cv2.IMREAD_GRAYSCALE)
         msk = cv2.imread(item["mask"], cv2.IMREAD_GRAYSCALE)
 
-        if img is None: raise FileNotFoundError(f"Img not found: {item['image']}")
-        if msk is None: raise FileNotFoundError(f"Mask not found: {item['mask']}")
+        if img is None:
+            raise FileNotFoundError(item["image"])
+        if msk is None:
+            raise FileNotFoundError(item["mask"])
 
         img = self.clahe(image=img)["image"]
+
         img = self._resize_pad(img, is_mask=False)
         msk = self._resize_pad(msk, is_mask=True)
 
         img = img.astype(np.float32) / 255.0
         msk = (msk > 127).astype(np.float32)
 
-        img_t = torch.from_numpy(img).unsqueeze(0) 
-        msk_t = torch.from_numpy(msk).unsqueeze(0) 
+        img = torch.from_numpy(img).unsqueeze(0)
+        msk = torch.from_numpy(msk).unsqueeze(0)
 
-        return {"image": img_t, "mask": msk_t, "path": item["image"]}
+        return {
+            "image": img,
+            "mask": msk,
+            "path": item["image"]
+        }
+
 
 def prepare_and_load_data(cfg):
     # 1. Logic Split SAMA PERSIS dengan Baseline

@@ -50,7 +50,7 @@ class Config:
     PATIENCE = 12              
     CLIP_LIMIT = 3.0           
     
-    NUM_WORKERS = 0             
+    NUM_WORKERS = 4             
     SEED = 42
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
